@@ -1,0 +1,6 @@
+pandas
+pymupdf
+streamlit
+re
+zipfile
+gc
