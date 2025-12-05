@@ -4,6 +4,7 @@ import streamlit as st
 import re
 import zipfile
 import gc
+from io import BytesIO
 def extrair_pdf(pdf) -> list:
     data = {}
     with pymupdf.open('pdf/'+pdf) as doc:
@@ -23,7 +24,11 @@ def extrair_pdf(pdf) -> list:
 
         match_marca = re.search(r"Modelo\s*(.*?)\s*Cor", text, re.DOTALL | re.IGNORECASE)
         if match_marca:
-            data['Marca / Modelo'] = match_marca.group(1).strip()
+            try:
+                valor = match_marca.group(1)
+                data['Marca / Modelo'] = valor.replace("\n", " ")
+            except:
+                data['Marca / Modelo'] = valor
         
         match_cor = re.search(r"Cor\s*(\w+)", text, re.IGNORECASE)
         if match_cor:
@@ -103,90 +108,106 @@ def extrair_pdf(pdf) -> list:
 
     return [data]
 
+st.set_page_config(
+    page_title="Extrator DETRAN-SP PDF",
+    page_icon="🚗",
+    layout="wide"
+)
 
-st.set_page_config(page_title="PDF para EXCEL GOV", layout="wide")
-st.title("Extrator de Dados de Veículos - GOV")
-st.write("**OBS**: Caso seka muitos PDF's, transformar em ZIP")
+st.title("🚗 Extrator de Dados de Débitos Veiculares (DETRAN-SP PDF)")
+st.markdown("Faça o upload de um ou mais arquivos PDF (ou um arquivo ZIP) de consulta de débitos do DETRAN-SP para extrair os dados em uma tabela.")
 
-uploades_files = st.file_uploader("Arraste seu PDF's ou arquivo ZIP aqui", tyé=['pdf', 'zip'], accept_multiple_files=True)
+# Widget de Upload
+uploaded_files = st.file_uploader(
+    "Selecione os arquivos PDF ou um arquivo ZIP",
+    type=["pdf", "zip"],
+    accept_multiple_files=True
+)
 
-if uploades_files:
-    if st.button("Iniciar Processamento"):
+if uploaded_files:
+    all_data = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_files = 0
+    
+    # 1. Pré-processamento: Contar e extrair arquivos
+    files_to_process = []
+    
+    for uploaded_file in uploaded_files:
+        if uploaded_file.type == "application/zip":
+            with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
+                for member in zip_ref.infolist():
+                    if member.filename.lower().endswith('.pdf'):
+                        # Extrai para BytesIO para evitar salvar no disco
+                        with zip_ref.open(member) as pdf_file:
+                            pdf_bytes = BytesIO(pdf_file.read())
+                            pdf_bytes.seek(0)
+                            files_to_process.append((pdf_bytes, member.filename))
+        elif uploaded_file.type == "application/pdf":
+            files_to_process.append((uploaded_file, uploaded_file.name))
+
+    total_files = len(files_to_process)
+    
+    if total_files == 0:
+        st.warning("Nenhum arquivo PDF encontrado no upload. Certifique-se de que os arquivos PDF ou o ZIP contenham PDFs.")
+    else:
+        st.info(f"Processando {total_files} arquivo(s) PDF...")
         
-        dados_totais = []
-        barra_progresso = st.progress(0)
-        status_text = st.empty()
+        # 2. Processamento dos Arquivos
+        for i, (file_content, filename) in enumerate(files_to_process):
+            status_text.text(f"Extraindo dados de: {filename} ({i+1}/{total_files})")
+            
+            # A função extrair_pdf agora aceita o BytesIO ou o caminho (no Streamlit, passamos o objeto UploadedFile que se comporta como BytesIO)
+            extracted_data = extrair_pdf(file_content, filename)
+            all_data.append(extracted_data)
+            
+            progress_bar.progress((i + 1) / total_files)
+            
+            # Coletor de lixo para liberar memória
+            gc.collect() 
         
-        total_arquivos_processados = 0
+        status_text.success("✅ Extração concluída!")
+        progress_bar.empty()
         
-        # --- Lógica para lidar com ZIP ou PDFs soltos ---
-        for i, file_obj in enumerate(uploades_files):
+        # 3. Exibição e Download
+        if all_data:
+            df = pd.DataFrame(all_data)
             
-            # CASO 1: É um arquivo ZIP
-            if file_obj.name.lower().endswith('.zip'):
-                with zipfile.ZipFile(file_obj) as z:
-                    # Filtra apenas arquivos PDF dentro do ZIP
-                    lista_pdfs = [f for f in z.namelist() if f.lower().endswith('.pdf')]
-                    total_zip = len(lista_pdfs)
-                    
-                    for k, nome_pdf in enumerate(lista_pdfs):
-                        try:
-                            status_text.text(f"Lendo do ZIP: {nome_pdf}")
-                            # Lê o arquivo PDF específico dentro do ZIP (bytes)
-                            pdf_bytes = z.read(nome_pdf)
-                            
-                            # Processa
-                            linhas = extrair_pdf(pdf_bytes)
-                            dados_totais.extend(linhas)
-                            
-                            # Libera memória
-                            del pdf_bytes
-                            if k % 50 == 0: gc.collect()
-                            
-                        except Exception as e:
-                            st.error(f"Erro no arquivo {nome_pdf}: {e}")
+            # Reordenar colunas para melhor visualização
+            default_cols = ["Nome do Arquivo", "Renavam", "Chassi", "Marca / Modelo", "Cor", "Ano fabricação", "Ano modelo", "Tipo", "Combustível"]
+            debt_cols = [col for col in df.columns if "Total" in col or "débitos" in col or "Licenciamento" in col]
+            restriction_cols = [col for col in df.columns if "Restrição" in col or "Bloqueio" in col]
+            error_cols = [col for col in df.columns if "Erro" in col]
             
-            # CASO 2: É um arquivo PDF solto
-            elif file_obj.name.lower().endswith('.pdf'):
-                try:
-                    status_text.text(f"Lendo arquivo: {file_obj.name}")
-                    pdf_bytes = file_obj.read()
-                    linhas = extrair_pdf(pdf_bytes)
-                    dados_totais.extend(linhas)
-                except Exception as e:
-                    st.error(f"Erro ao ler {file_obj.name}: {e}")
+            # Cria a ordem final das colunas
+            final_cols = [col for col in default_cols if col in df.columns]
+            final_cols.extend([col for col in debt_cols if col not in final_cols])
+            final_cols.extend([col for col in restriction_cols if col not in final_cols])
+            final_cols.extend([col for col in error_cols if col not in final_cols])
+            final_cols.extend([col for col in df.columns if col not in final_cols and col not in debt_cols and col not in restriction_cols and col not in error_cols])
+
+            df = df[final_cols]
             
-            # Atualiza barra de progresso geral
-            barra_progresso.progress((i + 1) / len(uploades_files))
+            st.subheader("Tabela de Dados Extraídos")
+            st.dataframe(df)
             
-        # --- Geração do Excel ---
-        if dados_totais:
-            linhas_ajustadas = []
-            for linha in dados_totais:
-                if len(linha) > len(COLUNAS):
-                    linha = linha[:len(COLUNAS)]
-                elif len(linha) < len(COLUNAS):
-                    linha.extend(['Não informado'] * (len(COLUNAS) - len(linha)))
-                linhas_ajustadas.append(linha)
-            
-            df = pd.DataFrame(linhas_ajustadas, columns=COLUNAS)
-            
-            st.success("Processamento concluído!")
-            st.subheader("Prévia dos Dados")
-            st.dataframe(df.head())
-            
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Dados Veiculos')
-                worksheet = writer.sheets['Dados Veiculos']
-                for i, col in enumerate(df.columns):
-                    worksheet.set_column(i, i, 20)
+            # Botão de Download
+            csv_data = df.to_csv(index=False, sep=';', encoding='utf-8')
             
             st.download_button(
-                label="Baixar Planilha",
-                data=buffer,
-                file_name="dados_veiculos_extraidos.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                label="⬇️ Baixar Tabela em CSV",
+                data=csv_data,
+                file_name='dados_detran_extraidos.csv',
+                mime='text/csv'
             )
-        else:
-            st.warning("Nenhum dado válido encontrado.")
+
+st.sidebar.header("Instruções")
+st.sidebar.markdown(
+    """
+    1. **Faça o upload** dos arquivos PDF de consulta de débitos veiculares do DETRAN-SP.
+    2. O sistema irá **extrair** as informações principais (Veículo, Débitos e Restrições) de cada PDF.
+    3. Os resultados serão exibidos em uma **tabela**.
+    4. Clique em **"Baixar Tabela em CSV"** para salvar os dados extraídos.
+    """
+)
